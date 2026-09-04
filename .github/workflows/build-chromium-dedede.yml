@@ -1,0 +1,229 @@
+name: Dedede ChromiumOS repo assets (Firefox rootfs + splash)
+
+# Public ChromiumOS repo (not Simple Chrome):
+#   repo init -u https://chromium.googlesource.com/chromiumos/manifest -b stable
+#   board overlay: src/overlays/overlay-dedede
+
+on:
+  workflow_dispatch:
+    inputs:
+      firefox_version:
+        description: "Official Firefox version (linux-x86_64 from Mozilla FTP)"
+        required: true
+        default: "140.0"
+      board:
+        description: "ChromiumOS board"
+        required: true
+        default: "dedede"
+      manifest_branch:
+        description: "chromiumos/manifest branch"
+        required: true
+        default: "stable"
+      try_full_repo_sync:
+        description: "repo sync the full ChromiumOS tree (needs a huge self-hosted runner)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+jobs:
+  package-from-chromeos-repo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      BOARD: ${{ github.event.inputs.board || 'dedede' }}
+      FIREFOX_VERSION: ${{ github.event.inputs.firefox_version || '140.0' }}
+      MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch || 'stable' }}
+      CROS_MANIFEST: https://chromium.googlesource.com/chromiumos/manifest
+      CROS_BOARD_OVERLAYS: https://chromium.googlesource.com/chromiumos/overlays/board-overlays
+      CROS_OVERLAY: https://chromium.googlesource.com/chromiumos/overlays/chromiumos-overlay
+
+    steps:
+      - name: Checkout this GitHub repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 curl wget ca-certificates tar xz-utils unzip file imagemagick librsvg2-bin
+
+      - name: Install depot_tools (provides repo)
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$GITHUB_WORKSPACE/depot_tools" >> "$GITHUB_PATH"
+          git config --global user.email "ci@example.com"
+          git config --global user.name "GitHub Actions"
+          git config --global --add safe.directory '*'
+
+      - name: Clone public ChromiumOS overlay + manifest repos
+        run: |
+          set -euo pipefail
+          mkdir -p chromiumos
+          git clone --depth=1 -b "${MANIFEST_BRANCH}" "${CROS_MANIFEST}" chromiumos/manifest || git clone --depth=1 "${CROS_MANIFEST}" chromiumos/manifest
+          git clone --depth=1 "${CROS_BOARD_OVERLAYS}" chromiumos/src/overlays
+          git clone --depth=1 "${CROS_OVERLAY}" chromiumos/src/third_party/chromiumos-overlay
+          ls -la "chromiumos/src/overlays/overlay-${BOARD}"
+
+      - name: Generate Firefox x ChromiumOS boot splash
+        run: |
+          set -euo pipefail
+          mkdir -p splash/frames
+          cat > splash/boot-logo.svg << 'SVG'
+          <svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+            <rect width="1920" height="1080" fill="#0b1a2b"/>
+            <circle cx="760" cy="500" r="150" fill="#ff7139"/>
+            <circle cx="760" cy="500" r="78" fill="#0b1a2b"/>
+            <circle cx="1160" cy="500" r="150" fill="none" stroke="#4285f4" stroke-width="36"/>
+            <circle cx="1160" cy="500" r="58" fill="#4285f4"/>
+            <text x="960" y="760" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="52" fill="#f4f7fb">Firefox  x  ChromiumOS</text>
+            <text x="960" y="820" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="28" fill="#9bb0c9">custom test image · board dedede</text>
+          </svg>
+          SVG
+          rsvg-convert -w 1920 -h 1080 splash/boot-logo.svg -o splash/boot-logo-1920.png
+          convert splash/boot-logo-1920.png -resize 1280x800^ -gravity center -extent 1280x800 splash/frames/boot_splash_frame01.png
+          cp splash/frames/boot_splash_frame01.png splash/frames/boot_splash_frame02.png
+
+      - name: Generate sibling overlay next to overlay-dedede
+        run: |
+          set -euo pipefail
+          OVERLAY=chromiumos/src/overlays/overlay-custom-firefox
+          mkdir -p "$OVERLAY/profiles" "$OVERLAY/metadata" "$OVERLAY/www-client/firefox-bin/files" "$OVERLAY/chromeos-base/firefox-desktop-hook" "$OVERLAY/chromeos-base/firefox-bootsplash/files/splash"
+          echo "custom-firefox" > "$OVERLAY/profiles/repo_name"
+          cat > "$OVERLAY/metadata/layout.conf" << 'EOF'
+          masters = portage-stable chromiumos
+          profile-formats = portage-2
+          repo-name = custom-firefox
+          EOF
+          cat > "$OVERLAY/www-client/firefox-bin/files/firefox-wrapper.sh" << 'EOF'
+          #!/bin/sh
+          exec /opt/firefox/firefox "$@"
+          EOF
+          chmod 0755 "$OVERLAY/www-client/firefox-bin/files/firefox-wrapper.sh"
+          cat > "$OVERLAY/www-client/firefox-bin/files/firefox.desktop" << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Firefox
+          Exec=/usr/local/bin/firefox %u
+          Icon=firefox
+          Terminal=false
+          Categories=Network;WebBrowser;
+          EOF
+          cat > "$OVERLAY/www-client/firefox-bin/firefox-bin-${FIREFOX_VERSION}.ebuild" << EOF
+          EAPI="7"
+          DESCRIPTION="Official Mozilla Firefox unpacked into the ChromiumOS rootfs"
+          HOMEPAGE="https://www.mozilla.org/firefox/"
+          SRC_URI="https://ftp.mozilla.org/pub/firefox/releases/\${PV}/linux-x86_64/en-US/firefox-\${PV}.tar.xz"
+          LICENSE="MPL-2.0"
+          SLOT="0"
+          KEYWORDS="amd64"
+          RESTRICT="mirror strip"
+          S="\${WORKDIR}/firefox"
+          src_install() {
+            dodir /opt/firefox
+            cp -a "\${S}"/. "\${ED}/opt/firefox/" || die
+            fperms 0755 /opt/firefox/firefox
+            exeinto /usr/local/bin
+            newexe "\${FILESDIR}/firefox-wrapper.sh" firefox
+            insinto /usr/share/applications
+            doins "\${FILESDIR}/firefox.desktop"
+          }
+          EOF
+          cat > "$OVERLAY/chromeos-base/firefox-desktop-hook/firefox-desktop-hook-1.ebuild" << 'EOF'
+          EAPI="7"
+          DESCRIPTION="Pull official Firefox plus custom boot splash into a custom ChromiumOS image"
+          LICENSE="BSD"
+          SLOT="0"
+          KEYWORDS="*"
+          RDEPEND="www-client/firefox-bin chromeos-base/firefox-bootsplash"
+          DEPEND="${RDEPEND}"
+          EOF
+          cp -a splash/frames/. "$OVERLAY/chromeos-base/firefox-bootsplash/files/splash/"
+          cp splash/boot-logo.svg splash/boot-logo-1920.png "$OVERLAY/chromeos-base/firefox-bootsplash/files/splash/"
+          cat > "$OVERLAY/chromeos-base/firefox-bootsplash/firefox-bootsplash-1.ebuild" << 'EOF'
+          EAPI="7"
+          DESCRIPTION="Custom Firefox x ChromiumOS boot splash for test images"
+          LICENSE="BSD"
+          SLOT="0"
+          KEYWORDS="*"
+          S="${WORKDIR}"
+          src_install() {
+            insinto /usr/share/chromeos-assets/images_100_percent
+            doins "${FILESDIR}/splash/boot_splash_frame01.png" || die
+            insinto /usr/share/firefox-os-splash
+            doins "${FILESDIR}/splash/"* || die
+          }
+          EOF
+          tar -C chromiumos/src/overlays -czf overlay-custom-firefox.tar.gz overlay-custom-firefox
+          tar -czf firefox-chromiumos-bootsplash.tar.gz splash
+          tar -C chromiumos/src/overlays -czf overlay-${BOARD}-public-tree.tar.gz "overlay-${BOARD}"
+
+      - name: Download official Firefox used by the ebuild
+        run: |
+          wget -O "firefox-${FIREFOX_VERSION}-linux64.tar.xz" \
+            "https://ftp.mozilla.org/pub/firefox/releases/${FIREFOX_VERSION}/linux-x86_64/en-US/firefox-${FIREFOX_VERSION}.tar.xz"
+
+      - name: Optional full ChromiumOS repo sync
+        if: ${{ github.event.inputs.try_full_repo_sync == 'true' }}
+        run: |
+          set -euo pipefail
+          echo "Full ChromiumOS repo sync is huge. Expected to fail on ubuntu-latest."
+          cd chromiumos
+          repo init -u "${CROS_MANIFEST}" -b "${MANIFEST_BRANCH}"
+          repo sync -j4
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BOARD }}-chromeos-repo-firefox-assets
+          path: |
+            overlay-custom-firefox.tar.gz
+            overlay-${{ env.BOARD }}-public-tree.tar.gz
+            firefox-chromiumos-bootsplash.tar.gz
+            firefox-*-linux64.tar.xz
+          retention-days: 14
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BOARD }}-cros-repo-${{ github.run_number }}
+          name: ${{ env.BOARD }} ChromiumOS repo + Firefox overlay (${{ github.run_number }})
+          body: |
+            Built from the public ChromiumOS repo.
+
+            repo init -u https://chromium.googlesource.com/chromiumos/manifest -b ${{ env.MANIFEST_BRANCH }}
+
+            Files:
+            - overlay-custom-firefox.tar.gz
+            - overlay-${{ env.BOARD }}-public-tree.tar.gz
+            - firefox-chromiumos-bootsplash.tar.gz
+            - firefox-${{ env.FIREFOX_VERSION }}-linux64.tar.xz
+
+            Bake on a workstation:
+            ```
+            repo init -u https://chromium.googlesource.com/chromiumos/manifest -b stable
+            repo sync -j8
+            tar -xzf overlay-custom-firefox.tar.gz -C src/overlays
+            setup_board --board=${{ env.BOARD }}
+            emerge-${{ env.BOARD }} chromeos-base/firefox-desktop-hook
+            cros build-packages --board=${{ env.BOARD }}
+            cros build-image --board=${{ env.BOARD }} --no-enable-rootfs-verification test
+            ```
+
+            Unsigned custom images do not boot on a locked production bootloader.
+          files: |
+            overlay-custom-firefox.tar.gz
+            overlay-${{ env.BOARD }}-public-tree.tar.gz
+            firefox-chromiumos-bootsplash.tar.gz
+            firefox-${{ env.FIREFOX_VERSION }}-linux64.tar.xz
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
