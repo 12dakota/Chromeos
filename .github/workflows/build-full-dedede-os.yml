@@ -1,0 +1,83 @@
+name: Build full dedede OS (Firefox + splash + USB image)
+
+# ONE workflow. Calls scripts/build-dedede-os.sh
+#
+# ubuntu-latest cannot finish this (about 14 GB).
+# Use either:
+#   - a self-hosted runner labeled cros-builder
+#   - a paid GitHub larger runner (Team/Enterprise), e.g. 16-core / 600 GB
+#
+# Set input runner_label to the machine that should compile.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner label (cros-builder, or a GitHub larger-runner label you configured)"
+        required: true
+        default: "cros-builder"
+      board:
+        description: "Board"
+        required: true
+        default: "dedede"
+      firefox_version:
+        description: "Official Firefox version to bake into rootfs"
+        required: true
+        default: "140.0"
+      manifest_branch:
+        description: "chromiumos/manifest branch"
+        required: true
+        default: "stable"
+
+permissions:
+  contents: write
+
+jobs:
+  build-full-os:
+    runs-on: ${{ github.event.inputs.runner_label }}
+    timeout-minutes: 720
+    env:
+      BOARD: ${{ github.event.inputs.board }}
+      FIREFOX_VERSION: ${{ github.event.inputs.firefox_version }}
+      MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch }}
+      INCLUDE_FIREFOX: "1"
+      CROS_ROOT: ${{ github.workspace }}/chromiumos
+      OUT_DIR: ${{ github.workspace }}/flash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 curl wget tar xz-utils gzip zstd imagemagick librsvg2-bin ca-certificates
+
+      - name: Build full OS with Firefox and splash
+        run: bash scripts/build-dedede-os.sh
+
+      - name: Publish USB image to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BOARD }}-full-os-${{ github.run_number }}
+          name: ${{ env.BOARD }} full ChromiumOS image + Firefox (${{ github.run_number }})
+          make_latest: true
+          fail_on_unmatched_files: false
+          files: |
+            flash/chromiumos_test_image-${{ env.BOARD }}.bin.zst
+            flash/chromiumos_test_image-${{ env.BOARD }}.bin.gz
+            flash/SHA256SUMS
+          body: |
+            Full test image for `${{ env.BOARD }}` with official Firefox in the rootfs
+            and a custom Firefox x ChromiumOS splash.
+
+            Built by `scripts/build-dedede-os.sh`.
+            Unsigned. Developer-mode hardware only.
+
+            ```
+            zstd -d chromiumos_test_image-${{ env.BOARD }}.bin.zst
+            sudo dd if=chromiumos_test_image-${{ env.BOARD }}.bin of=/dev/sdX bs=4M status=progress conv=fsync
+            ```
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
