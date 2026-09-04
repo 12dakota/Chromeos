@@ -179,28 +179,28 @@ jobs:
           repo init -u "${CROS_MANIFEST}" -b "${MANIFEST_BRANCH}"
           repo sync -j4
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BOARD }}-chromeos-repo-firefox-assets
-          path: |
-            overlay-custom-firefox.tar.gz
-            overlay-${{ env.BOARD }}-public-tree.tar.gz
-            firefox-chromiumos-bootsplash.tar.gz
-            firefox-*-linux64.tar.xz
-          retention-days: 14
+      - name: Verify release files
+        run: |
+          set -euo pipefail
+          ls -lh \
+            overlay-custom-firefox.tar.gz \
+            overlay-${BOARD}-public-tree.tar.gz \
+            firefox-chromiumos-bootsplash.tar.gz \
+            firefox-${FIREFOX_VERSION}-linux64.tar.xz
 
-      - name: Create GitHub Release
+      - name: Publish files to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.BOARD }}-cros-repo-${{ github.run_number }}
           name: ${{ env.BOARD }} ChromiumOS repo + Firefox overlay (${{ github.run_number }})
+          make_latest: true
+          fail_on_unmatched_files: true
           body: |
             Built from the public ChromiumOS repo.
 
             repo init -u https://chromium.googlesource.com/chromiumos/manifest -b ${{ env.MANIFEST_BRANCH }}
 
-            Files:
+            Release assets:
             - overlay-custom-firefox.tar.gz
             - overlay-${{ env.BOARD }}-public-tree.tar.gz
             - firefox-chromiumos-bootsplash.tar.gz
@@ -224,6 +224,7 @@ jobs:
             firefox-chromiumos-bootsplash.tar.gz
             firefox-${{ env.FIREFOX_VERSION }}-linux64.tar.xz
           draft: false
-          prerelease: true
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
