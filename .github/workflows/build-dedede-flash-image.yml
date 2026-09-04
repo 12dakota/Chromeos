@@ -1,0 +1,170 @@
+name: Build dedede ChromiumOS USB flash image
+
+# Full board image for an unlocked / developer-mode Chromebook.
+# This cannot run on github-hosted ubuntu-latest (disk + time).
+# Register a self-hosted runner labeled: linux, x64, cros-builder
+# with ~16+ CPU, 32+ GB RAM, 300+ GB free disk.
+#
+# Output published only to GitHub Releases:
+#   chromiumos_test_image-dedede.bin.zst
+#
+# Flash on hardware you own, in developer mode. This is not a
+# Google-signed recovery image and will not boot a locked production device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: ChromiumOS board
+        required: true
+        default: dedede
+      manifest_branch:
+        description: chromiumos/manifest branch
+        required: true
+        default: stable
+      include_firefox_overlay:
+        description: Emerge the custom Firefox overlay from the latest overlay release
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build-flash-image:
+    runs-on: [self-hosted, linux, x64, cros-builder]
+    timeout-minutes: 720
+
+    env:
+      BOARD: ${{ github.event.inputs.board || 'dedede' }}
+      MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch || 'stable' }}
+      CROS_ROOT: ${{ github.workspace }}/chromiumos
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install depot_tools
+        run: |
+          if [ ! -d "$HOME/depot_tools" ]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          fi
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          git config --global user.email "ci@example.com"
+          git config --global user.name "GitHub Actions"
+          git config --global --add safe.directory '*'
+
+      - name: Init and sync public ChromiumOS tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$CROS_ROOT"
+          cd "$CROS_ROOT"
+          if [ ! -d .repo ]; then
+            repo init -u https://chromium.googlesource.com/chromiumos/manifest -b "$MANIFEST_BRANCH"
+          fi
+          repo sync -j8
+
+      - name: Fetch Firefox overlay from latest GitHub Release
+        if: ${{ github.event.inputs.include_firefox_overlay == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" \
+            -o /tmp/latest-release.json
+          python3 - <<'PY'
+          import json, urllib.request, os
+          rel = json.load(open("/tmp/latest-release.json"))
+          url = None
+          for a in rel.get("assets", []):
+              if a["name"] == "overlay-custom-firefox.tar.gz":
+                  url = a["browser_download_url"]
+          if not url:
+              raise SystemExit("overlay-custom-firefox.tar.gz not found on latest release")
+          print("downloading", url)
+          req = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"]})
+          with urllib.request.urlopen(req) as r, open("/tmp/overlay-custom-firefox.tar.gz", "wb") as f:
+              f.write(r.read())
+          PY
+          tar -tzf /tmp/overlay-custom-firefox.tar.gz | head
+          tar -xzf /tmp/overlay-custom-firefox.tar.gz -C "$CROS_ROOT/src/overlays"
+
+      - name: Enter SDK, setup board, build packages and image
+        run: |
+          set -euo pipefail
+          cd "$CROS_ROOT"
+          # First-time SDK creation is long.
+          chromite/bin/cros_sdk --create || true
+          chromite/bin/cros_sdk -- \
+            bash -lc "
+              set -euo pipefail
+              setup_board --board=${BOARD}
+              if [ -d /mnt/host/source/src/overlays/overlay-custom-firefox ]; then
+                emerge-${BOARD} chromeos-base/firefox-desktop-hook || echo 'Firefox overlay emerge failed; continuing with stock image packages'
+              fi
+              cros build-packages --board=${BOARD}
+              cros build-image --board=${BOARD} --no-enable-rootfs-verification test
+            "
+
+      - name: Package USB flash image
+        run: |
+          set -euo pipefail
+          IMG_DIR="$CROS_ROOT/src/build/images/${BOARD}/latest"
+          ls -lh "$IMG_DIR"
+          # Prefer the raw test image used for USB / cros flash
+          SRC=""
+          for cand in chromiumos_test_image.bin chromiumos_image.bin chromiumos_base_image.bin; do
+            if [ -f "$IMG_DIR/$cand" ]; then
+              SRC="$IMG_DIR/$cand"
+              break
+            fi
+          done
+          test -n "$SRC"
+          echo "Using $SRC"
+          mkdir -p "$GITHUB_WORKSPACE/flash"
+          # zstd is much faster to write later than xz for a multi-GB image
+          if command -v zstd >/dev/null; then
+            zstd -T0 -19 -f "$SRC" -o "$GITHUB_WORKSPACE/flash/chromiumos_test_image-${BOARD}.bin.zst"
+          else
+            gzip -c "$SRC" > "$GITHUB_WORKSPACE/flash/chromiumos_test_image-${BOARD}.bin.gz"
+          fi
+          sha256sum "$GITHUB_WORKSPACE/flash/"* | tee "$GITHUB_WORKSPACE/flash/SHA256SUMS"
+          ls -lh "$GITHUB_WORKSPACE/flash"
+
+      - name: Publish flash image to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BOARD }}-flash-${{ github.run_number }}
+          name: ${{ env.BOARD }} ChromiumOS USB image (${{ github.run_number }})
+          make_latest: true
+          fail_on_unmatched_files: true
+          body: |
+            Flashable **test** image for board `${{ env.BOARD }}`.
+
+            This is an unsigned developer image (`--no-enable-rootfs-verification`).
+            Use it on a Chromebook you own that is already in **developer mode**.
+            It will not boot a locked production device.
+
+            ## Write the USB
+            ```bash
+            zstd -d chromiumos_test_image-${{ env.BOARD }}.bin.zst
+            sudo dd if=chromiumos_test_image-${{ env.BOARD }}.bin of=/dev/sdX bs=4M status=progress conv=fsync
+            ```
+            Replace `/dev/sdX` with the USB disk, not a partition.
+
+            On the Chromebook: boot the USB, open a shell, then
+            `chromeos-install` onto internal storage, or use `cros flash` from the
+            ChromiumOS developer docs.
+          files: |
+            flash/chromiumos_test_image-${{ env.BOARD }}.bin.zst
+            flash/chromiumos_test_image-${{ env.BOARD }}.bin.gz
+            flash/SHA256SUMS
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
